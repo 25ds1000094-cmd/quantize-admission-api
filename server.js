@@ -20,12 +20,7 @@ function sortCodes(codes) {
 app.post('/quantize', (req, res) => {
   const body = req.body;
   
-  // DEBUG LOG: Print every incoming request payload to Render logs
-  console.log("=== INCOMING REQUEST BODY ===");
-  console.log(JSON.stringify(body, null, 2));
-
   if (!body || typeof body !== 'object' || !body.phase) {
-    console.log("REJECTED: Missing body or phase");
     return res.status(400).json({ error: 'INVALID_INPUT' });
   }
 
@@ -33,7 +28,6 @@ app.post('/quantize', (req, res) => {
 
   // Validate freezeId
   if (!freezeId || typeof freezeId !== 'string' || freezeId.length === 0 || freezeId.length > 128) {
-    console.log("REJECTED: Invalid freezeId ->", freezeId);
     return res.status(400).json({ error: 'INVALID_INPUT' });
   }
 
@@ -46,7 +40,6 @@ app.post('/quantize', (req, res) => {
     if (!calibrationDigest || typeof calibrationDigest !== 'string' ||
         !tokenizerDigest || typeof tokenizerDigest !== 'string' ||
         !Array.isArray(candidates) || candidates.length === 0) {
-      console.log("REJECTED [freeze]: Missing/invalid required freeze fields");
       return res.status(400).json({ error: 'INVALID_INPUT' });
     }
 
@@ -55,22 +48,25 @@ app.post('/quantize', (req, res) => {
       const existing = freezeStore.get(freezeId);
       // Replay if identical payload, otherwise conflict
       if (JSON.stringify(existing.inputPayload) !== JSON.stringify(body)) {
-        console.log("CONFLICT [freeze]: freezeId conflict detected");
         return res.status(409).json({ error: 'FREEZE_ID_CONFLICT' });
       }
       return res.json(existing.response);
     }
 
     const processedCandidates = [];
-    const candidateNames = new Set();
+    const seenCandidateNames = new Set();
     const allowedReasonsSet = new Set(Array.isArray(allowedUnsupportedReasons) ? allowedUnsupportedReasons : []);
 
     for (const c of candidates) {
-      if (!c.name || typeof c.name !== 'string' || candidateNames.has(c.name)) {
-        console.log("REJECTED [freeze]: Invalid candidate name");
+      if (!c || typeof c !== 'object' || !c.name || typeof c.name !== 'string') {
         return res.status(400).json({ error: 'INVALID_INPUT' });
       }
-      candidateNames.add(c.name);
+      
+      // Safely handle duplicate names by deduplicating instead of hard failing with 400
+      if (seenCandidateNames.has(c.name)) {
+        continue; 
+      }
+      seenCandidateNames.add(c.name);
 
       let inventory = [];
       let totalBytes = 0;
@@ -176,7 +172,6 @@ app.post('/quantize', (req, res) => {
     const { candidates, policy, latencies, rows } = body;
 
     if (!freezeStore.has(freezeId)) {
-      console.log("REJECTED [select]: freezeId not found in store ->", freezeId);
       return res.status(400).json({ error: 'INVALID_INPUT' });
     }
 
@@ -184,7 +179,6 @@ app.post('/quantize', (req, res) => {
     
     // Validate structural requirements for select request
     if (!Array.isArray(candidates) || !policy || typeof policy !== 'object' || !Array.isArray(rows) || !latencies || typeof latencies !== 'object') {
-      console.log("REJECTED [select]: Missing structural components (candidates, policy, rows, or latencies)");
       return res.status(400).json({ error: 'INVALID_INPUT' });
     }
 
@@ -194,13 +188,11 @@ app.post('/quantize', (req, res) => {
         typeof aggregateFloor !== 'number' || aggregateFloor < 0 || aggregateFloor > 1 ||
         typeof maxLatencyMs !== 'number' || maxLatencyMs < 0 ||
         !Array.isArray(candidateOrder)) {
-      console.log("REJECTED [select]: Invalid policy parameters");
       return res.status(400).json({ error: 'INVALID_INPUT' });
     }
 
     const candidateOrderNames = new Set(candidateOrder);
     if (candidateOrderNames.size !== candidateOrder.length) {
-      console.log("REJECTED [select]: Duplicate candidateOrder entries");
       return res.status(400).json({ error: 'INVALID_INPUT' });
     }
 
@@ -359,7 +351,6 @@ app.post('/quantize', (req, res) => {
     });
   }
 
-  console.log("REJECTED: Unknown phase ->", phase);
   return res.status(400).json({ error: 'INVALID_INPUT' });
 });
 
