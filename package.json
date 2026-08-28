@@ -1,11 +1,12 @@
 {
   "name": "quantize-admission-api",
   "version": "1.0.0",
+  "description": "Stateful two-phase quantized model candidate admission API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
-  "dependencies": {
-    "express": "^4.21.2"
+  "engines": {
+    "node": ">=18"
   }
 }
