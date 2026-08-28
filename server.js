@@ -231,86 +231,109 @@ function checkCandidate(candidate, body) {
 /* -------------------------------------------------------------------------- */
 
 function validateFreezeStructure(body) {
-  if (!isObject(body)) {
-    return 'request body must be an object';
+  if (!isPlainObject(body)) {
+    return false;
   }
 
   if (body.phase !== 'freeze') {
-    return 'phase must be freeze';
+    return false;
   }
 
   if (!isNonEmptyString(body.freezeId)) {
-    return 'freezeId is required';
+    return false;
+  }
+
+  if (body.freezeId.length > 128) {
+    return false;
   }
 
   if (!isNonEmptyString(body.calibrationDigest)) {
-    return 'calibrationDigest is required';
+    return false;
   }
 
   if (!isNonEmptyString(body.tokenizerDigest)) {
-    return 'tokenizerDigest is required';
+    return false;
   }
 
   if (!Array.isArray(body.allowedUnsupportedReasons)) {
-    return 'allowedUnsupportedReasons must be an array';
+    return false;
   }
 
+  // Empty candidate list is a malformed freeze request.
+  if (!Array.isArray(body.candidates) || body.candidates.length === 0) {
+    return false;
+  }
+
+  // Reasons must be non-empty strings.
   if (
-    !body.allowedUnsupportedReasons.every(
-      (reason) => typeof reason === 'string'
+    body.allowedUnsupportedReasons.some(
+      reason => !isNonEmptyString(reason)
     )
   ) {
-    return 'allowedUnsupportedReasons must contain strings';
+    return false;
   }
 
-  if (!Array.isArray(body.candidates)) {
-    return 'candidates must be an array';
+  // Duplicate allowed reasons are invalid.
+  const allowed = new Set(body.allowedUnsupportedReasons);
+
+  if (allowed.size !== body.allowedUnsupportedReasons.length) {
+    return false;
   }
 
-  /*
-   * Empty candidate lists are invalid.
-   */
-  if (body.candidates.length === 0) {
-    return 'candidates cannot be empty';
-  }
-
-  /*
-   * Duplicate allowed reasons are invalid.
-   */
-  const allowedReasons = new Set();
-
-  for (const reason of body.allowedUnsupportedReasons) {
-    if (allowedReasons.has(reason)) {
-      return `duplicate allowedUnsupportedReason: ${reason}`;
-    }
-
-    allowedReasons.add(reason);
-  }
-
-  /*
-   * Candidate names must always be unique, even if one of the candidates
-   * would otherwise be filtered out.
-   */
-  const names = new Set();
+  const candidateNames = new Set();
 
   for (const candidate of body.candidates) {
-    if (!isObject(candidate)) {
-      return 'candidate must be an object';
+    if (!isPlainObject(candidate)) {
+      return false;
     }
 
     if (!isNonEmptyString(candidate.name)) {
-      return 'candidate name is required';
+      return false;
     }
 
-    if (names.has(candidate.name)) {
-      return `duplicate candidate name: ${candidate.name}`;
+    // Duplicate names invalidate the ENTIRE freeze request.
+    if (candidateNames.has(candidate.name)) {
+      return false;
     }
 
-    names.add(candidate.name);
+    candidateNames.add(candidate.name);
+
+    // files must be an object, but it may be empty.
+    // An empty object is handled as candidate-level INVALID_INPUT
+    // by freezeCandidate().
+    if (!isPlainObject(candidate.files)) {
+      return false;
+    }
+
+    if (typeof candidate.loadable !== 'boolean') {
+      return false;
+    }
+
+    if (!isNonEmptyString(candidate.calibrationDigest)) {
+      return false;
+    }
+
+    if (!isNonEmptyString(candidate.tokenizerDigest)) {
+      return false;
+    }
+
+    // unsupportedReason is optional structurally.
+    // If supplied, it must be a non-empty string.
+    if (
+      Object.prototype.hasOwnProperty.call(
+        candidate,
+        'unsupportedReason'
+      )
+    ) {
+      if (!isNonEmptyString(candidate.unsupportedReason)) {
+        return false;
+      }
+    }
   }
 
-  return null;
+  return true;
 }
+
 
 /* -------------------------------------------------------------------------- */
 /* Freeze processing                                                          */
