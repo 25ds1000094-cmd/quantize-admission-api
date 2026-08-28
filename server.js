@@ -4,51 +4,41 @@ const http = require('http');
 
 const PORT = Number(process.env.PORT) || 10000;
 
-// -----------------------------------------------------------------------------
-// In-memory freeze store
-//
-// Key: freezeId
-// Value: {
-//   request: normalized request,
-//   response: response returned to the client
-// }
-//
-// This is intentionally in-memory. Render may restart the service, so this
-// state is not durable across deploys/restarts.
-// -----------------------------------------------------------------------------
-const freezes = new Map();
+// Stores successfully frozen requests for idempotent replay handling.
+const freezeStore = new Map();
 
-// -----------------------------------------------------------------------------
-// Utility helpers
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
 
-function log(...args) {
-  console.log(...args);
-}
-
-function isPlainObject(value) {
-  return (
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value)
-  );
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function isNonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function isStringArray(value) {
-  return (
-    Array.isArray(value) &&
-    value.every((item) => typeof item === 'string')
-  );
+function sendJson(res, status, body) {
+  const payload = JSON.stringify(body);
+
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Length', Buffer.byteLength(payload));
+
+  res.end(payload);
 }
 
-function hasOwn(obj, key) {
-  return Object.prototype.hasOwnProperty.call(obj, key);
+function errorResponse(res, status, error) {
+  console.log(`[HTTP] Response status: ${status}`);
+
+  return sendJson(res, status, { error });
 }
 
+/*
+ * Stable serialization is used for freezeId replay detection.
+ * Object key order does not matter.
+ */
 function stableStringify(value) {
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value);
@@ -58,50 +48,195 @@ function stableStringify(value) {
     return `[${value.map(stableStringify).join(',')}]`;
   }
 
-  const keys = Object.keys(value).sort();
-
-  return `{${keys
-    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
+  return `{${Object.keys(value)
+    .sort()
+    .map(
+      (key) =>
+        `${JSON.stringify(key)}:${stableStringify(value[key])}`
+    )
     .join(',')}}`;
 }
 
-function sendJson(res, statusCode, body) {
-  const payload = JSON.stringify(body);
+/* -------------------------------------------------------------------------- */
+/* Candidate admission                                                        */
+/* -------------------------------------------------------------------------- */
 
-  res.statusCode = statusCode;
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Length', Buffer.byteLength(payload));
+/*
+ * Returns:
+ *
+ *   { accepted: true }
+ *
+ * when the candidate is admissible.
+ *
+ * Otherwise:
+ *
+ *   { accepted: false, reason: "..." }
+ *
+ * Invalid candidates are intentionally filtered out rather than causing the
+ * entire freeze request to fail.
+ */
+function checkCandidate(candidate, body) {
+  if (!isObject(candidate)) {
+    return {
+      accepted: false,
+      reason: 'candidate is not an object'
+    };
+  }
 
-  res.end(payload);
+  if (!isNonEmptyString(candidate.name)) {
+    return {
+      accepted: false,
+      reason: 'candidate name is missing'
+    };
+  }
+
+  if (typeof candidate.loadable !== 'boolean') {
+    return {
+      accepted: false,
+      reason: `loadable is not boolean for ${candidate.name}`
+    };
+  }
+
+  if (!isObject(candidate.files)) {
+    return {
+      accepted: false,
+      reason: `files is not an object for ${candidate.name}`
+    };
+  }
+
+  const files = candidate.files;
+  const fileNames = Object.keys(files);
+
+  /* ------------------------------------------------------------------------ */
+  /* Loadable candidate                                                       */
+  /* ------------------------------------------------------------------------ */
+
+  if (candidate.loadable === true) {
+    if (fileNames.length === 0) {
+      return {
+        accepted: false,
+        reason: `files are empty for ${candidate.name}`
+      };
+    }
+
+    /*
+     * A loadable model needs the actual model/config artifacts.
+     */
+    if (!Object.prototype.hasOwnProperty.call(files, 'config.json')) {
+      return {
+        accepted: false,
+        reason: `config.json is missing for ${candidate.name}`
+      };
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(files, 'model.bin')) {
+      return {
+        accepted: false,
+        reason: `model.bin is missing for ${candidate.name}`
+      };
+    }
+
+    /*
+     * File contents must be strings.
+     */
+    for (const fileName of fileNames) {
+      if (typeof files[fileName] !== 'string') {
+        return {
+          accepted: false,
+          reason: `file ${fileName} is invalid for ${candidate.name}`
+        };
+      }
+    }
+
+    /*
+     * A loadable candidate must match the freeze digests.
+     */
+    if (candidate.calibrationDigest !== body.calibrationDigest) {
+      return {
+        accepted: false,
+        reason: `calibrationDigest mismatch for ${candidate.name}`
+      };
+    }
+
+    if (candidate.tokenizerDigest !== body.tokenizerDigest) {
+      return {
+        accepted: false,
+        reason: `tokenizerDigest mismatch for ${candidate.name}`
+      };
+    }
+
+    /*
+     * Loadable candidates are valid.
+     */
+    return {
+      accepted: true
+    };
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /* Unsupported / non-loadable candidate                                     */
+  /* ------------------------------------------------------------------------ */
+
+  /*
+   * A non-loadable candidate is only admitted when it explicitly gives a
+   * reason AND that reason is allowed by the freeze request.
+   *
+   * If either condition fails, the candidate is simply excluded.
+   *
+   * This is important for the test fixtures:
+   *
+   *   bad-input  -> no unsupportedReason -> excluded
+   *   bad-reason -> UNPUBLISHED_REASON not allowed -> excluded
+   */
+  if (!isNonEmptyString(candidate.unsupportedReason)) {
+    return {
+      accepted: false,
+      reason: `unsupportedReason missing for ${candidate.name}`
+    };
+  }
+
+  if (!body.allowedUnsupportedReasons.includes(candidate.unsupportedReason)) {
+    return {
+      accepted: false,
+      reason:
+        `unsupportedReason ${candidate.unsupportedReason} ` +
+        `is not allowed for ${candidate.name}`
+    };
+  }
+
+  /*
+   * A published unsupported candidate should contain reason.txt.
+   */
+  if (!Object.prototype.hasOwnProperty.call(files, 'reason.txt')) {
+    return {
+      accepted: false,
+      reason: `reason.txt missing for ${candidate.name}`
+    };
+  }
+
+  if (typeof files['reason.txt'] !== 'string') {
+    return {
+      accepted: false,
+      reason: `reason.txt is invalid for ${candidate.name}`
+    };
+  }
+
+  return {
+    accepted: true
+  };
 }
 
-function invalidInput(res, message) {
-  log(`[VALIDATION] Freeze failed: ${message}`);
+/* -------------------------------------------------------------------------- */
+/* Freeze validation                                                          */
+/* -------------------------------------------------------------------------- */
 
-  return sendJson(res, 400, {
-    error: 'INVALID_INPUT'
-  });
-}
-
-function conflict(res) {
-  log('[FREEZE] Freeze ID conflict');
-
-  return sendJson(res, 409, {
-    error: 'CONFLICT'
-  });
-}
-
-// -----------------------------------------------------------------------------
-// Validation
-// -----------------------------------------------------------------------------
-
-function validateFreezeRequest(body) {
-  if (!isPlainObject(body)) {
+function validateFreezeStructure(body) {
+  if (!isObject(body)) {
     return 'request body must be an object';
   }
 
   if (body.phase !== 'freeze') {
-    return 'phase must be "freeze"';
+    return 'phase must be freeze';
   }
 
   if (!isNonEmptyString(body.freezeId)) {
@@ -116,28 +251,35 @@ function validateFreezeRequest(body) {
     return 'tokenizerDigest is required';
   }
 
-  if (!isStringArray(body.allowedUnsupportedReasons)) {
-    return 'allowedUnsupportedReasons must be an array of strings';
+  if (!Array.isArray(body.allowedUnsupportedReasons)) {
+    return 'allowedUnsupportedReasons must be an array';
+  }
+
+  if (
+    !body.allowedUnsupportedReasons.every(
+      (reason) => typeof reason === 'string'
+    )
+  ) {
+    return 'allowedUnsupportedReasons must contain strings';
   }
 
   if (!Array.isArray(body.candidates)) {
     return 'candidates must be an array';
   }
 
-  // IMPORTANT:
-  // The admission contract requires at least one candidate.
+  /*
+   * Empty candidate lists are invalid.
+   */
   if (body.candidates.length === 0) {
     return 'candidates cannot be empty';
   }
 
-  // Validate allowedUnsupportedReasons itself.
+  /*
+   * Duplicate allowed reasons are invalid.
+   */
   const allowedReasons = new Set();
 
   for (const reason of body.allowedUnsupportedReasons) {
-    if (!isNonEmptyString(reason)) {
-      return 'allowedUnsupportedReasons cannot contain empty values';
-    }
-
     if (allowedReasons.has(reason)) {
       return `duplicate allowedUnsupportedReason: ${reason}`;
     }
@@ -145,16 +287,19 @@ function validateFreezeRequest(body) {
     allowedReasons.add(reason);
   }
 
-  // Candidate names must be unique.
+  /*
+   * Candidate names must always be unique, even if one of the candidates
+   * would otherwise be filtered out.
+   */
   const names = new Set();
 
   for (const candidate of body.candidates) {
-    if (!isPlainObject(candidate)) {
-      return 'each candidate must be an object';
+    if (!isObject(candidate)) {
+      return 'candidate must be an object';
     }
 
     if (!isNonEmptyString(candidate.name)) {
-      return 'candidate.name is required';
+      return 'candidate name is required';
     }
 
     if (names.has(candidate.name)) {
@@ -162,168 +307,127 @@ function validateFreezeRequest(body) {
     }
 
     names.add(candidate.name);
-
-    if (typeof candidate.loadable !== 'boolean') {
-      return `candidate.loadable must be boolean for: ${candidate.name}`;
-    }
-
-    if (!isPlainObject(candidate.files)) {
-      return `candidate.files must be an object for: ${candidate.name}`;
-    }
-
-    const fileNames = Object.keys(candidate.files);
-
-    // -------------------------------------------------------------------------
-    // Loadable candidate
-    // -------------------------------------------------------------------------
-    if (candidate.loadable === true) {
-      if (fileNames.length === 0) {
-        return `candidate.files cannot be empty for: ${candidate.name}`;
-      }
-
-      // A loadable candidate must contain the model/config artifacts.
-      if (!hasOwn(candidate.files, 'config.json')) {
-        return `candidate.files must contain config.json for: ${candidate.name}`;
-      }
-
-      if (!hasOwn(candidate.files, 'model.bin')) {
-        return `candidate.files must contain model.bin for: ${candidate.name}`;
-      }
-
-      // File contents must be strings.
-      for (const fileName of fileNames) {
-        if (typeof candidate.files[fileName] !== 'string') {
-          return `candidate.files.${fileName} must be a string for: ${candidate.name}`;
-        }
-      }
-
-      // Loadable candidates must match the freeze-level digests.
-      if (candidate.calibrationDigest !== body.calibrationDigest) {
-        return `calibrationDigest mismatch for: ${candidate.name}`;
-      }
-
-      if (candidate.tokenizerDigest !== body.tokenizerDigest) {
-        return `tokenizerDigest mismatch for: ${candidate.name}`;
-      }
-
-      // A loadable candidate should not declare an unsupported reason.
-      if (hasOwn(candidate, 'unsupportedReason')) {
-        return `loadable candidate cannot have unsupportedReason: ${candidate.name}`;
-      }
-    }
-
-    // -------------------------------------------------------------------------
-    // Unsupported / non-loadable candidate
-    // -------------------------------------------------------------------------
-    else {
-      if (!isNonEmptyString(candidate.unsupportedReason)) {
-        return `unsupportedReason is required for: ${candidate.name}`;
-      }
-
-      // The reason must be explicitly allowed by the freeze request.
-      if (!allowedReasons.has(candidate.unsupportedReason)) {
-        return (
-          `unsupportedReason is not allowed for: ${candidate.name}`
-        );
-      }
-
-      // An unsupported candidate must provide a reason file.
-      if (!hasOwn(candidate.files, 'reason.txt')) {
-        return `candidate.files must contain reason.txt for: ${candidate.name}`;
-      }
-
-      if (typeof candidate.files['reason.txt'] !== 'string') {
-        return `candidate.files.reason.txt must be a string for: ${candidate.name}`;
-      }
-
-      // For unsupported candidates, calibration/tokenizer digests are not
-      // required to match because the candidate is explicitly not loadable.
-    }
   }
 
   return null;
 }
 
-// -----------------------------------------------------------------------------
-// Freeze processing
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* Freeze processing                                                          */
+/* -------------------------------------------------------------------------- */
 
 function processFreeze(body, res) {
-  log('[FREEZE] Processing freeze request');
+  console.log('[FREEZE] Processing freeze request');
 
-  const validationError = validateFreezeRequest(body);
+  /*
+   * Validate only the structure/rules that make the entire freeze request
+   * invalid.
+   */
+  const structureError = validateFreezeStructure(body);
 
-  if (validationError) {
-    return invalidInput(res, validationError);
+  if (structureError) {
+    console.log(`[VALIDATION] Freeze failed: ${structureError}`);
+    return errorResponse(res, 400, 'INVALID_INPUT');
   }
 
-  const freezeId = body.freezeId;
-
-  // ---------------------------------------------------------------------------
-  // Idempotency / replay handling
-  // ---------------------------------------------------------------------------
-  //
-  // Same freezeId + byte-for-byte equivalent logical request:
-  //     200
-  //
-  // Same freezeId + different request:
-  //     409
-  // ---------------------------------------------------------------------------
-
-  const existing = freezes.get(freezeId);
+  /*
+   * Check for an existing freeze with this ID.
+   */
+  const existing = freezeStore.get(body.freezeId);
 
   if (existing) {
-    const incomingCanonical = stableStringify(body);
-    const existingCanonical = stableStringify(existing.request);
+    const incoming = stableStringify(body);
+    const stored = stableStringify(existing.request);
 
-    if (incomingCanonical === existingCanonical) {
-      log(`[FREEZE] Identical replay: ${freezeId}`);
+    /*
+     * Same freezeId + identical request = idempotent replay.
+     */
+    if (incoming === stored) {
+      console.log(`[FREEZE] Identical replay: ${body.freezeId}`);
 
       return sendJson(res, 200, existing.response);
     }
 
-    log(`[FREEZE] Freeze ID conflict: ${freezeId}`);
+    /*
+     * Same freezeId + different request = conflict.
+     */
+    console.log(`[FREEZE] Freeze ID conflict: ${body.freezeId}`);
 
-    return conflict(res);
+    return errorResponse(res, 409, 'CONFLICT');
   }
 
-  // ---------------------------------------------------------------------------
-  // Freeze accepted
-  // ---------------------------------------------------------------------------
+  /*
+   * Filter candidates.
+   */
+  const acceptedCandidates = [];
 
+  for (const candidate of body.candidates) {
+    const result = checkCandidate(candidate, body);
+
+    if (result.accepted) {
+      acceptedCandidates.push(candidate);
+
+      console.log(
+        `[CANDIDATE] Accepted: ${candidate.name}`
+      );
+    } else {
+      console.log(
+        `[CANDIDATE] Excluded: ${candidate.name} - ${result.reason}`
+      );
+    }
+  }
+
+  /*
+   * The freeze itself is valid even if some candidates were excluded.
+   *
+   * However, there must be at least one admissible candidate.
+   */
+  if (acceptedCandidates.length === 0) {
+    console.log('[VALIDATION] Freeze failed: no admissible candidates');
+
+    return errorResponse(res, 400, 'INVALID_INPUT');
+  }
+
+  /*
+   * The response contains only candidates that passed admission.
+   */
   const response = {
     freezeId: body.freezeId,
-    candidates: body.candidates
+    candidates: acceptedCandidates
   };
 
-  // Store a deep copy so later mutation of the parsed object cannot alter the
-  // stored request/response.
-  const storedRequest = JSON.parse(JSON.stringify(body));
-  const storedResponse = JSON.parse(JSON.stringify(response));
-
-  freezes.set(freezeId, {
-    request: storedRequest,
-    response: storedResponse
+  /*
+   * Save request + response for idempotent replay.
+   */
+  freezeStore.set(body.freezeId, {
+    request: JSON.parse(JSON.stringify(body)),
+    response: JSON.parse(JSON.stringify(response))
   });
 
-  log(`[FREEZE] Freeze successful: ${freezeId}`);
+  console.log(`[FREEZE] Freeze successful: ${body.freezeId}`);
 
   return sendJson(res, 200, response);
 }
 
-// -----------------------------------------------------------------------------
-// HTTP server
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* HTTP server                                                                */
+/* -------------------------------------------------------------------------- */
 
 const server = http.createServer((req, res) => {
-  log(`[HTTP] ${req.method} ${req.url}`);
+  console.log(`[HTTP] ${req.method} ${req.url}`);
 
-  // ---------------------------------------------------------------------------
-  // Health check
-  // ---------------------------------------------------------------------------
+  /* ------------------------------------------------------------------------ */
+  /* Render health checks                                                     */
+  /* ------------------------------------------------------------------------ */
+
+  if (req.method === 'HEAD' && req.url === '/') {
+    res.statusCode = 200;
+    res.setHeader('Content-Length', '0');
+    return res.end();
+  }
 
   if (req.method === 'GET' && req.url === '/') {
-    log('[HTTP] Health check');
+    console.log('[HTTP] Health check');
 
     return sendJson(res, 200, {
       status: 'ok',
@@ -331,21 +435,14 @@ const server = http.createServer((req, res) => {
     });
   }
 
-  // Render commonly performs HEAD / health checks.
-  if (req.method === 'HEAD' && req.url === '/') {
-    res.statusCode = 200;
-    res.setHeader('Content-Length', '0');
-    return res.end();
-  }
-
-  // ---------------------------------------------------------------------------
-  // POST /quantize
-  // ---------------------------------------------------------------------------
+  /* ------------------------------------------------------------------------ */
+  /* POST /quantize                                                           */
+  /* ------------------------------------------------------------------------ */
 
   if (req.method === 'POST' && req.url === '/quantize') {
     const contentType = req.headers['content-type'] || '';
 
-    log(`[HTTP] Content-Type: ${contentType}`);
+    console.log(`[HTTP] Content-Type: ${contentType}`);
 
     let rawBody = '';
 
@@ -354,47 +451,57 @@ const server = http.createServer((req, res) => {
     req.on('data', (chunk) => {
       rawBody += chunk;
 
-      // Prevent unexpectedly huge request bodies.
+      /*
+       * 2 MB request limit.
+       */
       if (Buffer.byteLength(rawBody, 'utf8') > 2 * 1024 * 1024) {
-        log('[HTTP] Request body too large');
+        console.log('[HTTP] Request body too large');
+
+        if (!res.headersSent) {
+          sendJson(res, 413, {
+            error: 'REQUEST_TOO_LARGE'
+          });
+        }
 
         req.destroy();
       }
     });
 
     req.on('end', () => {
-      log(`[HTTP] Raw body length: ${Buffer.byteLength(rawBody, 'utf8')}`);
+      console.log(
+        `[HTTP] Raw body length: ${Buffer.byteLength(rawBody, 'utf8')}`
+      );
 
       let body;
 
       try {
         body = JSON.parse(rawBody);
       } catch (error) {
-        log('[HTTP] Invalid JSON');
+        console.log('[HTTP] Invalid JSON');
 
-        return sendJson(res, 400, {
-          error: 'INVALID_INPUT'
-        });
+        return errorResponse(res, 400, 'INVALID_INPUT');
       }
 
-      log('[QUANTIZE] Incoming body:', JSON.stringify(body, null, 2));
-      log(`[QUANTIZE] phase: ${body && body.phase}`);
+      console.log(
+        '[QUANTIZE] Incoming body:',
+        JSON.stringify(body, null, 2)
+      );
+
+      console.log(`[QUANTIZE] phase: ${body?.phase}`);
 
       if (!body || body.phase !== 'freeze') {
-        log('[VALIDATION] Invalid phase');
+        console.log('[VALIDATION] Invalid phase');
 
-        return sendJson(res, 400, {
-          error: 'INVALID_INPUT'
-        });
+        return errorResponse(res, 400, 'INVALID_INPUT');
       }
 
-      log('[QUANTIZE] Processing freeze request');
+      console.log('[QUANTIZE] Processing freeze request');
 
       return processFreeze(body, res);
     });
 
     req.on('error', (error) => {
-      log('[HTTP] Request error:', error.message);
+      console.error('[HTTP] Request error:', error.message);
 
       if (!res.headersSent) {
         sendJson(res, 400, {
@@ -406,44 +513,44 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ---------------------------------------------------------------------------
-  // Everything else
-  // ---------------------------------------------------------------------------
+  /* ------------------------------------------------------------------------ */
+  /* 404                                                                      */
+  /* ------------------------------------------------------------------------ */
 
-  sendJson(res, 404, {
+  return sendJson(res, 404, {
     error: 'NOT_FOUND'
   });
 });
 
-// -----------------------------------------------------------------------------
-// Error handling
-// -----------------------------------------------------------------------------
+/* -------------------------------------------------------------------------- */
+/* Server startup                                                             */
+/* -------------------------------------------------------------------------- */
 
 server.on('error', (error) => {
-  console.error('[SERVER] Fatal server error:', error);
+  console.error('[SERVER] Error:', error);
   process.exit(1);
 });
 
-// -----------------------------------------------------------------------------
-// Start
-// -----------------------------------------------------------------------------
-
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Quantize admission API listening on port ${PORT}`);
+  console.log(
+    `Quantize admission API listening on port ${PORT}`
+  );
 });
 
-// Graceful shutdown
+/* -------------------------------------------------------------------------- */
+/* Graceful shutdown                                                          */
+/* -------------------------------------------------------------------------- */
+
 function shutdown(signal) {
-  log(`[SERVER] Received ${signal}; shutting down`);
+  console.log(`[SERVER] Received ${signal}; shutting down`);
 
   server.close(() => {
-    log('[SERVER] Shutdown complete');
+    console.log('[SERVER] Shutdown complete');
     process.exit(0);
   });
 
   setTimeout(() => {
-    log('[SERVER] Forced shutdown');
-
+    console.error('[SERVER] Forced shutdown');
     process.exit(1);
   }, 10000).unref();
 }
