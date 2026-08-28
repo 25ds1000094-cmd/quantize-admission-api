@@ -1,24 +1,52 @@
 'use strict';
 
 const http = require('http');
-const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT) || 10000;
 
-// Stores accepted freeze requests by freezeId.
-// Render instances normally run one process, so this is sufficient for the
-// admission API's request/replay semantics.
-const freezeStore = new Map();
+// -----------------------------------------------------------------------------
+// In-memory freeze store
+//
+// Key: freezeId
+// Value: {
+//   request: normalized request,
+//   response: response returned to the client
+// }
+//
+// This is intentionally in-memory. Render may restart the service, so this
+// state is not durable across deploys/restarts.
+// -----------------------------------------------------------------------------
+const freezes = new Map();
+
+// -----------------------------------------------------------------------------
+// Utility helpers
+// -----------------------------------------------------------------------------
 
 function log(...args) {
   console.log(...args);
 }
 
-function makeError(code, message) {
-  return {
-    error: code,
-    ...(message ? { message } : {})
-  };
+function isPlainObject(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value)
+  );
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isStringArray(value) {
+  return (
+    Array.isArray(value) &&
+    value.every((item) => typeof item === 'string')
+  );
+}
+
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
 }
 
 function stableStringify(value) {
@@ -33,45 +61,40 @@ function stableStringify(value) {
   const keys = Object.keys(value).sort();
 
   return `{${keys
-    .map(
-      (key) =>
-        `${JSON.stringify(key)}:${stableStringify(value[key])}`
-    )
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`)
     .join(',')}}`;
 }
 
-function requestDigest(body) {
-  return crypto
-    .createHash('sha256')
-    .update(stableStringify(body))
-    .digest('hex');
-}
-
-function sendJson(res, statusCode, payload) {
-  const body = JSON.stringify(payload);
+function sendJson(res, statusCode, body) {
+  const payload = JSON.stringify(body);
 
   res.statusCode = statusCode;
   res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Length', Buffer.byteLength(body));
+  res.setHeader('Content-Length', Buffer.byteLength(payload));
 
-  res.end(body);
+  res.end(payload);
 }
 
-function isPlainObject(value) {
-  return (
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value)
-  );
+function invalidInput(res, message) {
+  log(`[VALIDATION] Freeze failed: ${message}`);
+
+  return sendJson(res, 400, {
+    error: 'INVALID_INPUT'
+  });
 }
 
-function hasNonEmptyObject(value) {
-  return isPlainObject(value) && Object.keys(value).length > 0;
+function conflict(res) {
+  log('[FREEZE] Freeze ID conflict');
+
+  return sendJson(res, 409, {
+    error: 'CONFLICT'
+  });
 }
 
-/**
- * Validate the common freeze-level fields.
- */
+// -----------------------------------------------------------------------------
+// Validation
+// -----------------------------------------------------------------------------
+
 function validateFreezeRequest(body) {
   if (!isPlainObject(body)) {
     return 'request body must be an object';
@@ -81,38 +104,20 @@ function validateFreezeRequest(body) {
     return 'phase must be "freeze"';
   }
 
-  if (
-    typeof body.freezeId !== 'string' ||
-    body.freezeId.trim() === ''
-  ) {
+  if (!isNonEmptyString(body.freezeId)) {
     return 'freezeId is required';
   }
 
-  if (
-    typeof body.calibrationDigest !== 'string' ||
-    body.calibrationDigest.trim() === ''
-  ) {
+  if (!isNonEmptyString(body.calibrationDigest)) {
     return 'calibrationDigest is required';
   }
 
-  if (
-    typeof body.tokenizerDigest !== 'string' ||
-    body.tokenizerDigest.trim() === ''
-  ) {
+  if (!isNonEmptyString(body.tokenizerDigest)) {
     return 'tokenizerDigest is required';
   }
 
-  if (!Array.isArray(body.allowedUnsupportedReasons)) {
-    return 'allowedUnsupportedReasons must be an array';
-  }
-
-  for (const reason of body.allowedUnsupportedReasons) {
-    if (
-      typeof reason !== 'string' ||
-      reason.trim() === ''
-    ) {
-      return 'allowedUnsupportedReasons must contain strings';
-    }
+  if (!isStringArray(body.allowedUnsupportedReasons)) {
+    return 'allowedUnsupportedReasons must be an array of strings';
   }
 
   if (!Array.isArray(body.candidates)) {
@@ -120,422 +125,328 @@ function validateFreezeRequest(body) {
   }
 
   // IMPORTANT:
-  // An empty candidate list is invalid.
+  // The admission contract requires at least one candidate.
   if (body.candidates.length === 0) {
     return 'candidates cannot be empty';
   }
 
-  return null;
-}
+  // Validate allowedUnsupportedReasons itself.
+  const allowedReasons = new Set();
 
-/**
- * Validate a loadable candidate.
- *
- * A loadable candidate must:
- * - have a name
- * - have files
- * - have at least one file
- * - have matching calibration digest
- * - have matching tokenizer digest
- */
-function validateLoadableCandidate(candidate, body) {
-  if (!isPlainObject(candidate)) {
-    return false;
-  }
-
-  if (
-    typeof candidate.name !== 'string' ||
-    candidate.name.trim() === ''
-  ) {
-    return false;
-  }
-
-  if (!hasNonEmptyObject(candidate.files)) {
-    return false;
-  }
-
-  if (candidate.loadable !== true) {
-    return false;
-  }
-
-  if (candidate.calibrationDigest !== body.calibrationDigest) {
-    return false;
-  }
-
-  if (candidate.tokenizerDigest !== body.tokenizerDigest) {
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Validate an explicitly unsupported candidate.
- *
- * Unsupported candidates are allowed only when:
- *
- *   candidate.unsupportedReason
- *
- * appears in:
- *
- *   allowedUnsupportedReasons
- *
- * Invalid unsupported candidates are ignored rather than causing the entire
- * freeze to fail.
- */
-function validateUnsupportedCandidate(candidate, body) {
-  if (!isPlainObject(candidate)) {
-    return false;
-  }
-
-  if (
-    typeof candidate.name !== 'string' ||
-    candidate.name.trim() === ''
-  ) {
-    return false;
-  }
-
-  if (candidate.loadable !== false) {
-    return false;
-  }
-
-  if (
-    typeof candidate.unsupportedReason !== 'string' ||
-    candidate.unsupportedReason.trim() === ''
-  ) {
-    return false;
-  }
-
-  if (
-    !body.allowedUnsupportedReasons.includes(
-      candidate.unsupportedReason
-    )
-  ) {
-    return false;
-  }
-
-  // An unsupported candidate should still publish a reason file.
-  if (!hasNonEmptyObject(candidate.files)) {
-    return false;
-  }
-
-  if (!Object.prototype.hasOwnProperty.call(candidate.files, 'reason.txt')) {
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Return only candidates that are admissible.
- *
- * Invalid candidates such as:
- *
- *   bad-input
- *   bad-reason
- *
- * are intentionally ignored.
- *
- * This is important because the admission payload can contain a mixture
- * of valid and invalid candidate artifacts.
- */
-function getAdmissibleCandidates(body) {
-  const admissible = [];
-
-  for (const candidate of body.candidates) {
-    if (validateLoadableCandidate(candidate, body)) {
-      admissible.push(candidate);
-      continue;
+  for (const reason of body.allowedUnsupportedReasons) {
+    if (!isNonEmptyString(reason)) {
+      return 'allowedUnsupportedReasons cannot contain empty values';
     }
 
-    if (validateUnsupportedCandidate(candidate, body)) {
-      admissible.push(candidate);
-      continue;
+    if (allowedReasons.has(reason)) {
+      return `duplicate allowedUnsupportedReason: ${reason}`;
     }
 
-    // Invalid candidate:
-    // intentionally ignored.
+    allowedReasons.add(reason);
   }
 
-  return admissible;
-}
-
-/**
- * Validate duplicate names among candidates that actually passed admission.
- */
-function validateDuplicateNames(candidates) {
+  // Candidate names must be unique.
   const names = new Set();
 
-  for (const candidate of candidates) {
+  for (const candidate of body.candidates) {
+    if (!isPlainObject(candidate)) {
+      return 'each candidate must be an object';
+    }
+
+    if (!isNonEmptyString(candidate.name)) {
+      return 'candidate.name is required';
+    }
+
     if (names.has(candidate.name)) {
       return `duplicate candidate name: ${candidate.name}`;
     }
 
     names.add(candidate.name);
+
+    if (typeof candidate.loadable !== 'boolean') {
+      return `candidate.loadable must be boolean for: ${candidate.name}`;
+    }
+
+    if (!isPlainObject(candidate.files)) {
+      return `candidate.files must be an object for: ${candidate.name}`;
+    }
+
+    const fileNames = Object.keys(candidate.files);
+
+    // -------------------------------------------------------------------------
+    // Loadable candidate
+    // -------------------------------------------------------------------------
+    if (candidate.loadable === true) {
+      if (fileNames.length === 0) {
+        return `candidate.files cannot be empty for: ${candidate.name}`;
+      }
+
+      // A loadable candidate must contain the model/config artifacts.
+      if (!hasOwn(candidate.files, 'config.json')) {
+        return `candidate.files must contain config.json for: ${candidate.name}`;
+      }
+
+      if (!hasOwn(candidate.files, 'model.bin')) {
+        return `candidate.files must contain model.bin for: ${candidate.name}`;
+      }
+
+      // File contents must be strings.
+      for (const fileName of fileNames) {
+        if (typeof candidate.files[fileName] !== 'string') {
+          return `candidate.files.${fileName} must be a string for: ${candidate.name}`;
+        }
+      }
+
+      // Loadable candidates must match the freeze-level digests.
+      if (candidate.calibrationDigest !== body.calibrationDigest) {
+        return `calibrationDigest mismatch for: ${candidate.name}`;
+      }
+
+      if (candidate.tokenizerDigest !== body.tokenizerDigest) {
+        return `tokenizerDigest mismatch for: ${candidate.name}`;
+      }
+
+      // A loadable candidate should not declare an unsupported reason.
+      if (hasOwn(candidate, 'unsupportedReason')) {
+        return `loadable candidate cannot have unsupportedReason: ${candidate.name}`;
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Unsupported / non-loadable candidate
+    // -------------------------------------------------------------------------
+    else {
+      if (!isNonEmptyString(candidate.unsupportedReason)) {
+        return `unsupportedReason is required for: ${candidate.name}`;
+      }
+
+      // The reason must be explicitly allowed by the freeze request.
+      if (!allowedReasons.has(candidate.unsupportedReason)) {
+        return (
+          `unsupportedReason is not allowed for: ${candidate.name}`
+        );
+      }
+
+      // An unsupported candidate must provide a reason file.
+      if (!hasOwn(candidate.files, 'reason.txt')) {
+        return `candidate.files must contain reason.txt for: ${candidate.name}`;
+      }
+
+      if (typeof candidate.files['reason.txt'] !== 'string') {
+        return `candidate.files.reason.txt must be a string for: ${candidate.name}`;
+      }
+
+      // For unsupported candidates, calibration/tokenizer digests are not
+      // required to match because the candidate is explicitly not loadable.
+    }
   }
 
   return null;
 }
 
-/**
- * Validate that we actually have at least one usable candidate after
- * filtering invalid candidates.
- */
-function validateAdmissibleCandidates(candidates) {
-  if (!Array.isArray(candidates) || candidates.length === 0) {
-    return 'no admissible candidates';
-  }
+// -----------------------------------------------------------------------------
+// Freeze processing
+// -----------------------------------------------------------------------------
 
-  return null;
-}
-
-/**
- * Process a freeze request.
- */
-function processFreeze(body) {
+function processFreeze(body, res) {
   log('[FREEZE] Processing freeze request');
 
   const validationError = validateFreezeRequest(body);
 
   if (validationError) {
-    log(`[VALIDATION] Freeze failed: ${validationError}`);
-
-    return {
-      status: 400,
-      body: makeError('INVALID_INPUT')
-    };
+    return invalidInput(res, validationError);
   }
 
   const freezeId = body.freezeId;
-  const digest = requestDigest(body);
 
-  /*
-   * Replay semantics:
-   *
-   * Same freezeId + exactly same request => 200 replay.
-   *
-   * Same freezeId + different request => 409 conflict.
-   */
-  const existing = freezeStore.get(freezeId);
+  // ---------------------------------------------------------------------------
+  // Idempotency / replay handling
+  // ---------------------------------------------------------------------------
+  //
+  // Same freezeId + byte-for-byte equivalent logical request:
+  //     200
+  //
+  // Same freezeId + different request:
+  //     409
+  // ---------------------------------------------------------------------------
+
+  const existing = freezes.get(freezeId);
 
   if (existing) {
-    if (existing.digest === digest) {
+    const incomingCanonical = stableStringify(body);
+    const existingCanonical = stableStringify(existing.request);
+
+    if (incomingCanonical === existingCanonical) {
       log(`[FREEZE] Identical replay: ${freezeId}`);
 
-      return {
-        status: 200,
-        body: existing.response
-      };
+      return sendJson(res, 200, existing.response);
     }
 
     log(`[FREEZE] Freeze ID conflict: ${freezeId}`);
 
-    return {
-      status: 409,
-      body: makeError('CONFLICT')
-    };
+    return conflict(res);
   }
 
-  /*
-   * Filter out malformed candidates.
-   *
-   * The incoming test payload intentionally contains:
-   *
-   *   fp32        -> valid
-   *   int8        -> valid
-   *   int4        -> valid
-   *   unsupported -> valid because BACKEND_UNAVAILABLE is allowed
-   *   bad-input   -> invalid, ignored
-   *   bad-reason  -> invalid, ignored
-   */
-  const admissibleCandidates = getAdmissibleCandidates(body);
+  // ---------------------------------------------------------------------------
+  // Freeze accepted
+  // ---------------------------------------------------------------------------
 
-  const duplicateError =
-    validateDuplicateNames(admissibleCandidates);
-
-  if (duplicateError) {
-    log(`[VALIDATION] Freeze failed: ${duplicateError}`);
-
-    return {
-      status: 400,
-      body: makeError('INVALID_INPUT')
-    };
-  }
-
-  const noCandidatesError =
-    validateAdmissibleCandidates(admissibleCandidates);
-
-  if (noCandidatesError) {
-    log(`[VALIDATION] Freeze failed: ${noCandidatesError}`);
-
-    return {
-      status: 400,
-      body: makeError('INVALID_INPUT')
-    };
-  }
-
-  /*
-   * Preserve the candidate objects from the request, but return only
-   * candidates that passed admission.
-   */
   const response = {
-    freezeId,
-    candidates: admissibleCandidates
+    freezeId: body.freezeId,
+    candidates: body.candidates
   };
 
-  freezeStore.set(freezeId, {
-    digest,
-    response
+  // Store a deep copy so later mutation of the parsed object cannot alter the
+  // stored request/response.
+  const storedRequest = JSON.parse(JSON.stringify(body));
+  const storedResponse = JSON.parse(JSON.stringify(response));
+
+  freezes.set(freezeId, {
+    request: storedRequest,
+    response: storedResponse
   });
 
   log(`[FREEZE] Freeze successful: ${freezeId}`);
 
-  return {
-    status: 200,
-    body: response
-  };
+  return sendJson(res, 200, response);
 }
 
-/**
- * Read an HTTP request body.
- */
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalLength = 0;
+// -----------------------------------------------------------------------------
+// HTTP server
+// -----------------------------------------------------------------------------
 
-    req.on('data', (chunk) => {
-      totalLength += chunk.length;
-
-      // Prevent unexpectedly large requests from consuming memory.
-      if (totalLength > 10 * 1024 * 1024) {
-        reject(new Error('REQUEST_TOO_LARGE'));
-        req.destroy();
-        return;
-      }
-
-      chunks.push(chunk);
-    });
-
-    req.on('end', () => {
-      resolve(Buffer.concat(chunks).toString('utf8'));
-    });
-
-    req.on('error', reject);
-  });
-}
-
-/**
- * HTTP server.
- */
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
   log(`[HTTP] ${req.method} ${req.url}`);
 
-  /*
-   * Render health checks commonly hit HEAD /.
-   */
-  if (req.url === '/' && (req.method === 'GET' || req.method === 'HEAD')) {
-    if (req.method === 'HEAD') {
-      res.statusCode = 200;
-      res.end();
-      return;
-    }
+  // ---------------------------------------------------------------------------
+  // Health check
+  // ---------------------------------------------------------------------------
 
-    sendJson(res, 200, {
+  if (req.method === 'GET' && req.url === '/') {
+    log('[HTTP] Health check');
+
+    return sendJson(res, 200, {
       status: 'ok',
       service: 'quantize-admission-api'
     });
-
-    return;
   }
 
-  if (req.url === '/quantize' && req.method === 'POST') {
+  // Render commonly performs HEAD / health checks.
+  if (req.method === 'HEAD' && req.url === '/') {
+    res.statusCode = 200;
+    res.setHeader('Content-Length', '0');
+    return res.end();
+  }
+
+  // ---------------------------------------------------------------------------
+  // POST /quantize
+  // ---------------------------------------------------------------------------
+
+  if (req.method === 'POST' && req.url === '/quantize') {
     const contentType = req.headers['content-type'] || '';
 
     log(`[HTTP] Content-Type: ${contentType}`);
 
-    let rawBody;
+    let rawBody = '';
 
-    try {
-      rawBody = await readBody(req);
-    } catch (error) {
-      log(`[HTTP] Body read failed: ${error.message}`);
+    req.setEncoding('utf8');
 
-      sendJson(
-        res,
-        413,
-        makeError('INVALID_INPUT')
-      );
+    req.on('data', (chunk) => {
+      rawBody += chunk;
 
-      return;
-    }
+      // Prevent unexpectedly huge request bodies.
+      if (Buffer.byteLength(rawBody, 'utf8') > 2 * 1024 * 1024) {
+        log('[HTTP] Request body too large');
 
-    log(`[HTTP] Raw body length: ${Buffer.byteLength(rawBody)}`);
+        req.destroy();
+      }
+    });
 
-    let body;
+    req.on('end', () => {
+      log(`[HTTP] Raw body length: ${Buffer.byteLength(rawBody, 'utf8')}`);
 
-    try {
-      body = JSON.parse(rawBody);
-    } catch (error) {
-      log(`[HTTP] JSON parse failed: ${error.message}`);
+      let body;
 
-      sendJson(
-        res,
-        400,
-        makeError('INVALID_INPUT')
-      );
+      try {
+        body = JSON.parse(rawBody);
+      } catch (error) {
+        log('[HTTP] Invalid JSON');
 
-      return;
-    }
+        return sendJson(res, 400, {
+          error: 'INVALID_INPUT'
+        });
+      }
 
-    log(
-      '[QUANTIZE] Incoming body:',
-      JSON.stringify(body, null, 2)
-    );
+      log('[QUANTIZE] Incoming body:', JSON.stringify(body, null, 2));
+      log(`[QUANTIZE] phase: ${body && body.phase}`);
 
-    if (body && body.phase) {
-      log(`[QUANTIZE] phase: ${body.phase}`);
-    }
+      if (!body || body.phase !== 'freeze') {
+        log('[VALIDATION] Invalid phase');
 
-    if (!body || body.phase !== 'freeze') {
-      log('[VALIDATION] Invalid or missing phase');
+        return sendJson(res, 400, {
+          error: 'INVALID_INPUT'
+        });
+      }
 
-      sendJson(
-        res,
-        400,
-        makeError('INVALID_INPUT')
-      );
+      log('[QUANTIZE] Processing freeze request');
 
-      return;
-    }
+      return processFreeze(body, res);
+    });
 
-    log('[QUANTIZE] Processing freeze request');
+    req.on('error', (error) => {
+      log('[HTTP] Request error:', error.message);
 
-    const result = processFreeze(body);
-
-    sendJson(res, result.status, result.body);
-
-    log(`[HTTP] Response status: ${result.status}`);
+      if (!res.headersSent) {
+        sendJson(res, 400, {
+          error: 'INVALID_INPUT'
+        });
+      }
+    });
 
     return;
   }
 
-  /*
-   * Unknown route.
-   */
+  // ---------------------------------------------------------------------------
+  // Everything else
+  // ---------------------------------------------------------------------------
+
   sendJson(res, 404, {
     error: 'NOT_FOUND'
   });
-
-  log('[HTTP] 404 NOT_FOUND');
 });
+
+// -----------------------------------------------------------------------------
+// Error handling
+// -----------------------------------------------------------------------------
 
 server.on('error', (error) => {
-  console.error('[SERVER] Error:', error);
+  console.error('[SERVER] Fatal server error:', error);
+  process.exit(1);
 });
 
+// -----------------------------------------------------------------------------
+// Start
+// -----------------------------------------------------------------------------
+
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(
-    `Quantize admission API listening on port ${PORT}`
-  );
+  console.log(`Quantize admission API listening on port ${PORT}`);
 });
+
+// Graceful shutdown
+function shutdown(signal) {
+  log(`[SERVER] Received ${signal}; shutting down`);
+
+  server.close(() => {
+    log('[SERVER] Shutdown complete');
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    log('[SERVER] Forced shutdown');
+
+    process.exit(1);
+  }, 10000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
