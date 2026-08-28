@@ -22,7 +22,11 @@ function sendJson(res, status, body) {
 
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Length', Buffer.byteLength(text, 'utf8'));
+  res.setHeader(
+    'Content-Length',
+    Buffer.byteLength(text, 'utf8')
+  );
+
   res.end(text);
 }
 
@@ -41,7 +45,10 @@ function isPlainObject(value) {
 }
 
 function isNonEmptyString(value) {
-  return typeof value === 'string' && value.length > 0;
+  return (
+    typeof value === 'string' &&
+    value.length > 0
+  );
 }
 
 function isSafeNonNegativeInteger(value) {
@@ -53,20 +60,31 @@ function isSafeNonNegativeInteger(value) {
 }
 
 function isFiniteNumber(value) {
-  return typeof value === 'number' && Number.isFinite(value);
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value)
+  );
 }
 
 function isFloor(value) {
-  return isFiniteNumber(value) && value >= 0 && value <= 1;
+  return (
+    isFiniteNumber(value) &&
+    value >= 0 &&
+    value <= 1
+  );
 }
 
 function isUniqueNonEmptyStringArray(value) {
-  if (!Array.isArray(value)) return false;
+  if (!Array.isArray(value)) {
+    return false;
+  }
 
   const seen = new Set();
 
   for (const item of value) {
-    if (!isNonEmptyString(item)) return false;
+    if (!isNonEmptyString(item)) {
+      return false;
+    }
 
     if (seen.has(item)) {
       return false;
@@ -88,7 +106,10 @@ function compareUtf8(a, b) {
   const ab = Buffer.from(a, 'utf8');
   const bb = Buffer.from(b, 'utf8');
 
-  const len = Math.min(ab.length, bb.length);
+  const len = Math.min(
+    ab.length,
+    bb.length
+  );
 
   for (let i = 0; i < len; i++) {
     if (ab[i] !== bb[i]) {
@@ -110,27 +131,37 @@ function sha256Utf8(value) {
     .digest('hex');
 }
 
-function stableStringify(value) {
-  return JSON.stringify(value);
-}
-
 function canonicalFreezeInput(body) {
   return JSON.stringify(body);
-}
-
-function canonicalCandidateNames(candidates) {
-  return sortUtf8(candidates.map(c => c.name));
 }
 
 /*
  * --------------------------------------------------------------------------
  * Freeze validation
  * --------------------------------------------------------------------------
+ *
+ * IMPORTANT:
+ *
+ * candidate.files is allowed to be an EMPTY object.
+ *
+ * This is intentional because a candidate such as:
+ *
+ * {
+ *   "name": "bad-input",
+ *   "files": {},
+ *   ...
+ * }
+ *
+ * should be accepted as a candidate and classified as invalid,
+ * rather than causing the entire freeze request to return 400.
+ * --------------------------------------------------------------------------
  */
 
 function validateFreezeStructure(body) {
   if (!isPlainObject(body)) {
-    console.log('[VALIDATION] Freeze failed: body is not an object');
+    console.log(
+      '[VALIDATION] Freeze failed: body is not an object'
+    );
     return false;
   }
 
@@ -222,6 +253,12 @@ function validateFreezeStructure(body) {
 
     candidateNames.add(candidate.name);
 
+    /*
+     * files must be an object.
+     *
+     * IMPORTANT:
+     * An empty files object IS allowed.
+     */
     if (!isPlainObject(candidate.files)) {
       console.log(
         '[VALIDATION] Freeze failed: candidate.files must be an object for:',
@@ -230,18 +267,15 @@ function validateFreezeStructure(body) {
       return false;
     }
 
-    const fileNames = Object.keys(candidate.files);
-
-    if (fileNames.length === 0) {
-      console.log(
-        '[VALIDATION] Freeze failed: candidate.files cannot be empty for:',
-        candidate.name
-      );
-      return false;
-    }
+    const fileNames = Object.keys(
+      candidate.files
+    );
 
     const fileSet = new Set();
 
+    /*
+     * This loop intentionally allows zero files.
+     */
     for (const fileName of fileNames) {
       if (!isNonEmptyString(fileName)) {
         console.log(
@@ -261,15 +295,27 @@ function validateFreezeStructure(body) {
 
       fileSet.add(fileName);
 
-      if (typeof candidate.files[fileName] !== 'string') {
+      if (
+        typeof candidate.files[fileName] !==
+        'string'
+      ) {
         console.log(
           '[VALIDATION] Freeze failed: file content must be a string:',
-          fileName
+          fileName,
+          'candidate:',
+          candidate.name
         );
         return false;
       }
 
-      Buffer.from(candidate.files[fileName], 'utf8');
+      /*
+       * Force UTF-8 conversion so byte calculations
+       * remain deterministic.
+       */
+      Buffer.from(
+        candidate.files[fileName],
+        'utf8'
+      );
     }
 
     if (typeof candidate.loadable !== 'boolean') {
@@ -282,7 +328,11 @@ function validateFreezeStructure(body) {
       return false;
     }
 
-    if (!isNonEmptyString(candidate.calibrationDigest)) {
+    if (
+      !isNonEmptyString(
+        candidate.calibrationDigest
+      )
+    ) {
       console.log(
         '[VALIDATION] Freeze failed: candidate calibrationDigest invalid for:',
         candidate.name
@@ -290,7 +340,11 @@ function validateFreezeStructure(body) {
       return false;
     }
 
-    if (!isNonEmptyString(candidate.tokenizerDigest)) {
+    if (
+      !isNonEmptyString(
+        candidate.tokenizerDigest
+      )
+    ) {
       console.log(
         '[VALIDATION] Freeze failed: candidate tokenizerDigest invalid for:',
         candidate.name
@@ -300,10 +354,15 @@ function validateFreezeStructure(body) {
 
     /*
      * unsupportedReason is optional.
+     *
+     * If supplied, it must be a non-empty string.
      */
     if (
-      candidate.unsupportedReason !== undefined &&
-      !isNonEmptyString(candidate.unsupportedReason)
+      candidate.unsupportedReason !==
+        undefined &&
+      !isNonEmptyString(
+        candidate.unsupportedReason
+      )
     ) {
       console.log(
         '[VALIDATION] Freeze failed: unsupportedReason must be a non-empty string for:',
@@ -331,15 +390,18 @@ function makeInventory(candidate) {
   let totalBytes = 0;
 
   for (const name of fileNames) {
+    const content =
+      candidate.files[name];
+
     const bytes = Buffer.byteLength(
-      candidate.files[name],
+      content,
       'utf8'
     );
 
     const sha256 = crypto
       .createHash('sha256')
       .update(
-        Buffer.from(candidate.files[name], 'utf8')
+        Buffer.from(content, 'utf8')
       )
       .digest('hex');
 
@@ -352,9 +414,10 @@ function makeInventory(candidate) {
     totalBytes += bytes;
   }
 
-  const packageDigest = sha256Utf8(
-    JSON.stringify(inventory)
-  );
+  const packageDigest =
+    sha256Utf8(
+      JSON.stringify(inventory)
+    );
 
   return {
     inventory,
@@ -369,10 +432,14 @@ function makeInventory(candidate) {
  * --------------------------------------------------------------------------
  */
 
-function freezeCandidate(body, candidate) {
-  const allowedReasons = new Set(
-    body.allowedUnsupportedReasons
-  );
+function freezeCandidate(
+  body,
+  candidate
+) {
+  const allowedReasons =
+    new Set(
+      body.allowedUnsupportedReasons
+    );
 
   const {
     inventory,
@@ -383,21 +450,28 @@ function freezeCandidate(body, candidate) {
   const reasonCodes = [];
 
   const hasUnsupportedReason =
-    candidate.unsupportedReason !== undefined;
+    candidate.unsupportedReason !==
+    undefined;
 
   const reasonAllowed =
     hasUnsupportedReason &&
-    allowedReasons.has(candidate.unsupportedReason);
+    allowedReasons.has(
+      candidate.unsupportedReason
+    );
 
-  if (hasUnsupportedReason && !reasonAllowed) {
+  if (
+    hasUnsupportedReason &&
+    !reasonAllowed
+  ) {
     reasonCodes.push(
       'UNALLOWED_UNSUPPORTED_REASON'
     );
   }
 
   /*
-   * An allowed unsupported reason explicitly marks the
-   * candidate as unsupported.
+   * An explicitly supplied unsupported reason
+   * takes precedence over normal loadability/digest
+   * checks.
    */
   if (hasUnsupportedReason) {
     if (reasonAllowed) {
@@ -417,26 +491,33 @@ function freezeCandidate(body, candidate) {
       inventory,
       totalBytes,
       packageDigest,
-      reasonCodes: sortReasonCodes(reasonCodes)
+      reasonCodes:
+        sortReasonCodes(reasonCodes)
     };
   }
 
   if (candidate.loadable !== true) {
-    reasonCodes.push('NOT_LOADABLE');
+    reasonCodes.push(
+      'NOT_LOADABLE'
+    );
   }
 
   if (
     candidate.calibrationDigest !==
     body.calibrationDigest
   ) {
-    reasonCodes.push('CALIBRATION_MISMATCH');
+    reasonCodes.push(
+      'CALIBRATION_MISMATCH'
+    );
   }
 
   if (
     candidate.tokenizerDigest !==
     body.tokenizerDigest
   ) {
-    reasonCodes.push('TOKENIZER_MISMATCH');
+    reasonCodes.push(
+      'TOKENIZER_MISMATCH'
+    );
   }
 
   if (reasonCodes.length > 0) {
@@ -446,7 +527,8 @@ function freezeCandidate(body, candidate) {
       inventory,
       totalBytes,
       packageDigest,
-      reasonCodes: sortReasonCodes(reasonCodes)
+      reasonCodes:
+        sortReasonCodes(reasonCodes)
     };
   }
 
@@ -461,17 +543,26 @@ function freezeCandidate(body, candidate) {
 }
 
 function sortReasonCodes(codes) {
-  return [...new Set(codes)].sort(compareUtf8);
+  return [
+    ...new Set(codes)
+  ].sort(compareUtf8);
 }
 
 function buildFreezeResponse(body) {
-  const candidates = body.candidates
-    .map(candidate =>
-      freezeCandidate(body, candidate)
-    )
-    .sort((a, b) =>
-      compareUtf8(a.name, b.name)
-    );
+  const candidates =
+    body.candidates
+      .map(candidate =>
+        freezeCandidate(
+          body,
+          candidate
+        )
+      )
+      .sort((a, b) =>
+        compareUtf8(
+          a.name,
+          b.name
+        )
+      );
 
   return {
     freezeId: body.freezeId,
@@ -493,7 +584,11 @@ function validatePolicy(policy) {
     return false;
   }
 
-  if (!isSafeNonNegativeInteger(policy.maxBytes)) {
+  if (
+    !isSafeNonNegativeInteger(
+      policy.maxBytes
+    )
+  ) {
     console.log(
       '[VALIDATION] Select failed: policy.maxBytes must be a safe non-negative integer. Received:',
       policy.maxBytes
@@ -501,15 +596,23 @@ function validatePolicy(policy) {
     return false;
   }
 
-  if (!isFloor(policy.aggregateFloor)) {
+  if (
+    !isFloor(
+      policy.aggregateFloor
+    )
+  ) {
     console.log(
-      '[VALIDATION] Select failed: policy.aggregateFloor must be a number between 0 and 1. Received:',
+      '[VALIDATION] Select failed: policy.aggregateFloor must be between 0 and 1. Received:',
       policy.aggregateFloor
     );
     return false;
   }
 
-  if (!isPlainObject(policy.requiredSlices)) {
+  if (
+    !isPlainObject(
+      policy.requiredSlices
+    )
+  ) {
     console.log(
       '[VALIDATION] Select failed: policy.requiredSlices must be an object'
     );
@@ -528,17 +631,29 @@ function validatePolicy(policy) {
       return false;
     }
 
-    if (!isFloor(policy.requiredSlices[sliceName])) {
+    if (
+      !isFloor(
+        policy.requiredSlices[
+          sliceName
+        ]
+      )
+    ) {
       console.log(
         '[VALIDATION] Select failed: required slice floor must be between 0 and 1:',
         sliceName,
-        policy.requiredSlices[sliceName]
+        policy.requiredSlices[
+          sliceName
+        ]
       );
       return false;
     }
   }
 
-  if (!isFiniteNumber(policy.maxLatencyMs)) {
+  if (
+    !isFiniteNumber(
+      policy.maxLatencyMs
+    )
+  ) {
     console.log(
       '[VALIDATION] Select failed: policy.maxLatencyMs must be a finite number. Received:',
       policy.maxLatencyMs
@@ -615,7 +730,11 @@ function validateSelectStructure(body) {
     return false;
   }
 
-  for (const name of Object.keys(body.latencies)) {
+  for (
+    const name of Object.keys(
+      body.latencies
+    )
+  ) {
     if (!isNonEmptyString(name)) {
       console.log(
         '[VALIDATION] Select failed: latency candidate name is empty'
@@ -624,7 +743,9 @@ function validateSelectStructure(body) {
     }
 
     if (
-      !isFiniteNumber(body.latencies[name]) ||
+      !isFiniteNumber(
+        body.latencies[name]
+      ) ||
       body.latencies[name] < 0
     ) {
       console.log(
@@ -648,7 +769,10 @@ function validateSelectStructure(body) {
       return false;
     }
 
-    if (row.label !== 0 && row.label !== 1) {
+    if (
+      row.label !== 0 &&
+      row.label !== 1
+    ) {
       console.log(
         '[VALIDATION] Select failed: row.label must be 0 or 1. Received:',
         row.label
@@ -663,7 +787,11 @@ function validateSelectStructure(body) {
       return false;
     }
 
-    if (!isPlainObject(row.predictions)) {
+    if (
+      !isPlainObject(
+        row.predictions
+      )
+    ) {
       console.log(
         '[VALIDATION] Select failed: row.predictions must be an object'
       );
@@ -688,14 +816,25 @@ function candidateArrayExactlyEquals(
     return false;
   }
 
-  if (stored.length !== supplied.length) {
+  if (
+    stored.length !==
+    supplied.length
+  ) {
     return false;
   }
 
-  for (let i = 0; i < stored.length; i++) {
+  for (
+    let i = 0;
+    i < stored.length;
+    i++
+  ) {
     if (
-      JSON.stringify(stored[i]) !==
-      JSON.stringify(supplied[i])
+      JSON.stringify(
+        stored[i]
+      ) !==
+      JSON.stringify(
+        supplied[i]
+      )
     ) {
       return false;
     }
@@ -715,7 +854,8 @@ function validateCandidateOrder(
     return false;
   }
 
-  const orderSet = new Set(candidateOrder);
+  const orderSet =
+    new Set(candidateOrder);
 
   if (
     orderSet.size !==
@@ -724,20 +864,10 @@ function validateCandidateOrder(
     return false;
   }
 
-  for (const name of candidateOrder) {
+  for (
+    const name of candidateOrder
+  ) {
     if (!candidateNames.has(name)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-function validateRequiredSliceNames(
-  requiredSlices
-) {
-  for (const name of Object.keys(requiredSlices)) {
-    if (!isNonEmptyString(name)) {
       return false;
     }
   }
@@ -758,7 +888,8 @@ function recomputeManifest(candidate) {
     return null;
   }
 
-  const inventory = candidate.inventory;
+  const inventory =
+    candidate.inventory;
 
   const seenNames = new Set();
 
@@ -779,13 +910,20 @@ function recomputeManifest(candidate) {
 
     seenNames.add(item.name);
 
-    if (!isSafeNonNegativeInteger(item.bytes)) {
+    if (
+      !isSafeNonNegativeInteger(
+        item.bytes
+      )
+    ) {
       return null;
     }
 
     if (
-      typeof item.sha256 !== 'string' ||
-      !/^[0-9a-f]{64}$/.test(item.sha256)
+      typeof item.sha256 !==
+        'string' ||
+      !/^[0-9a-f]{64}$/.test(
+        item.sha256
+      )
     ) {
       return null;
     }
@@ -794,23 +932,34 @@ function recomputeManifest(candidate) {
   }
 
   /*
-   * Inventory must already be sorted by UTF-8 filename.
+   * Inventory must already be sorted
+   * by UTF-8 filename.
    */
-  const names = inventory.map(
-    item => item.name
-  );
+  const names =
+    inventory.map(
+      item => item.name
+    );
 
-  const sortedNames = sortUtf8(names);
+  const sortedNames =
+    sortUtf8(names);
 
-  for (let i = 0; i < names.length; i++) {
-    if (names[i] !== sortedNames[i]) {
+  for (
+    let i = 0;
+    i < names.length;
+    i++
+  ) {
+    if (
+      names[i] !==
+      sortedNames[i]
+    ) {
       return null;
     }
   }
 
-  const packageDigest = sha256Utf8(
-    JSON.stringify(inventory)
-  );
+  const packageDigest =
+    sha256Utf8(
+      JSON.stringify(inventory)
+    );
 
   return {
     totalBytes,
@@ -818,7 +967,9 @@ function recomputeManifest(candidate) {
   };
 }
 
-function validateFrozenManifest(candidate) {
+function validateFrozenManifest(
+  candidate
+) {
   if (!isPlainObject(candidate)) {
     return false;
   }
@@ -832,7 +983,9 @@ function validateFrozenManifest(candidate) {
   }
 
   const calculated =
-    recomputeManifest(candidate);
+    recomputeManifest(
+      candidate
+    );
 
   if (!calculated) {
     return false;
@@ -860,7 +1013,11 @@ function validateFrozenManifest(candidate) {
     return false;
   }
 
-  if (!Array.isArray(candidate.reasonCodes)) {
+  if (
+    !Array.isArray(
+      candidate.reasonCodes
+    )
+  ) {
     return false;
   }
 
@@ -873,12 +1030,19 @@ function validateFrozenManifest(candidate) {
  * --------------------------------------------------------------------------
  */
 
-function validateBinaryPrediction(value) {
-  return value === 0 || value === 1;
+function validateBinaryPrediction(
+  value
+) {
+  return (
+    value === 0 ||
+    value === 1
+  );
 }
 
 function round12(value) {
-  return Number(value.toFixed(12));
+  return Number(
+    value.toFixed(12)
+  );
 }
 
 function calculateCandidateMetrics(
@@ -887,15 +1051,21 @@ function calculateCandidateMetrics(
   requiredSlices
 ) {
   /*
-   * Empty rows cannot establish prediction accuracy.
+   * Empty rows cannot establish
+   * prediction accuracy.
    */
   if (rows.length === 0) {
     return {
       valid: false,
       aggregate: null,
       slices: Object.fromEntries(
-        Object.keys(requiredSlices).map(
-          name => [name, null]
+        Object.keys(
+          requiredSlices
+        ).map(
+          name => [
+            name,
+            null
+          ]
         )
       )
     };
@@ -903,16 +1073,26 @@ function calculateCandidateMetrics(
 
   let correct = 0;
 
-  const sliceTotals = new Map();
-  const sliceCorrect = new Map();
+  const sliceTotals =
+    new Map();
+
+  const sliceCorrect =
+    new Map();
 
   for (
     const requiredSlice of Object.keys(
       requiredSlices
     )
   ) {
-    sliceTotals.set(requiredSlice, 0);
-    sliceCorrect.set(requiredSlice, 0);
+    sliceTotals.set(
+      requiredSlice,
+      0
+    );
+
+    sliceCorrect.set(
+      requiredSlice,
+      0
+    );
   }
 
   for (const row of rows) {
@@ -926,50 +1106,81 @@ function calculateCandidateMetrics(
         valid: false,
         aggregate: null,
         slices: Object.fromEntries(
-          Object.keys(requiredSlices).map(
-            name => [name, null]
+          Object.keys(
+            requiredSlices
+          ).map(
+            name => [
+              name,
+              null
+            ]
           )
         )
       };
     }
 
     const prediction =
-      row.predictions[candidateName];
+      row.predictions[
+        candidateName
+      ];
 
-    if (!validateBinaryPrediction(prediction)) {
+    if (
+      !validateBinaryPrediction(
+        prediction
+      )
+    ) {
       return {
         valid: false,
         aggregate: null,
         slices: Object.fromEntries(
-          Object.keys(requiredSlices).map(
-            name => [name, null]
+          Object.keys(
+            requiredSlices
+          ).map(
+            name => [
+              name,
+              null
+            ]
           )
         )
       };
     }
 
-    if (prediction === row.label) {
+    if (
+      prediction === row.label
+    ) {
       correct++;
     }
 
-    if (sliceTotals.has(row.slice)) {
+    if (
+      sliceTotals.has(
+        row.slice
+      )
+    ) {
       sliceTotals.set(
         row.slice,
-        sliceTotals.get(row.slice) + 1
+        sliceTotals.get(
+          row.slice
+        ) + 1
       );
 
-      if (prediction === row.label) {
+      if (
+        prediction ===
+        row.label
+      ) {
         sliceCorrect.set(
           row.slice,
-          sliceCorrect.get(row.slice) + 1
+          sliceCorrect.get(
+            row.slice
+          ) + 1
         );
       }
     }
   }
 
-  const aggregate = round12(
-    correct / rows.length
-  );
+  const aggregate =
+    round12(
+      correct /
+      rows.length
+    );
 
   const slices = {};
 
@@ -978,17 +1189,21 @@ function calculateCandidateMetrics(
       requiredSlices
     )
   ) {
-    const total = sliceTotals.get(
-      sliceName
-    );
+    const total =
+      sliceTotals.get(
+        sliceName
+      );
 
     if (!total) {
-      slices[sliceName] = null;
+      slices[sliceName] =
+        null;
     } else {
-      slices[sliceName] = round12(
-        sliceCorrect.get(sliceName) /
-          total
-      );
+      slices[sliceName] =
+        round12(
+          sliceCorrect.get(
+            sliceName
+          ) / total
+        );
     }
   }
 
@@ -1016,29 +1231,38 @@ function buildSelectionResult(
   let aggregate = null;
   let slices = {};
 
-  /*
-   * Manifest must be valid before size/digest
-   * values can be trusted.
-   */
   const manifestValid =
-    validateFrozenManifest(candidate);
+    validateFrozenManifest(
+      candidate
+    );
 
   let totalBytes = null;
 
   if (manifestValid) {
     const calculated =
-      recomputeManifest(candidate);
+      recomputeManifest(
+        candidate
+      );
 
-    totalBytes = calculated.totalBytes;
+    totalBytes =
+      calculated.totalBytes;
   } else {
-    reasonCodes.push('INVALID_MANIFEST');
+    reasonCodes.push(
+      'INVALID_MANIFEST'
+    );
   }
 
   /*
-   * Only a frozen candidate is admissible.
+   * A frozen candidate is the only
+   * admissible lineage.
    */
-  if (candidate.status !== 'frozen') {
-    reasonCodes.push('INVALID_LINEAGE');
+  if (
+    candidate.status !==
+    'frozen'
+  ) {
+    reasonCodes.push(
+      'INVALID_LINEAGE'
+    );
   }
 
   const metrics =
@@ -1053,8 +1277,11 @@ function buildSelectionResult(
       'INVALID_PREDICTIONS'
     );
   } else {
-    aggregate = metrics.aggregate;
-    slices = metrics.slices;
+    aggregate =
+      metrics.aggregate;
+
+    slices =
+      metrics.slices;
   }
 
   if (metrics.valid) {
@@ -1073,7 +1300,8 @@ function buildSelectionResult(
       )
     ) {
       if (
-        slices[sliceName] === null
+        slices[sliceName] ===
+        null
       ) {
         reasonCodes.push(
           `MISSING_SLICE:${sliceName}`
@@ -1091,10 +1319,10 @@ function buildSelectionResult(
     }
   }
 
-  if (totalBytes === null) {
-    // Cannot validate size.
-  } else if (
-    totalBytes > policy.maxBytes
+  if (
+    totalBytes !== null &&
+    totalBytes >
+      policy.maxBytes
   ) {
     reasonCodes.push(
       'SIZE_LIMIT'
@@ -1104,10 +1332,13 @@ function buildSelectionResult(
   let latencyMs = null;
 
   if (
-    isFiniteNumber(latencyValue) &&
+    isFiniteNumber(
+      latencyValue
+    ) &&
     latencyValue >= 0
   ) {
-    latencyMs = latencyValue;
+    latencyMs =
+      latencyValue;
 
     if (
       latencyMs >
@@ -1119,13 +1350,16 @@ function buildSelectionResult(
     }
   } else {
     latencyMs = null;
+
     reasonCodes.push(
       'LATENCY_LIMIT'
     );
   }
 
   const sortedReasons =
-    sortReasonCodes(reasonCodes);
+    sortReasonCodes(
+      reasonCodes
+    );
 
   const admitted =
     sortedReasons.length === 0;
@@ -1137,7 +1371,8 @@ function buildSelectionResult(
     totalBytes,
     latencyMs,
     admitted,
-    reasonCodes: sortedReasons
+    reasonCodes:
+      sortedReasons
   };
 }
 
@@ -1149,23 +1384,39 @@ function compareCandidatePreference(
   /*
    * Smaller bytes wins.
    */
-  if (a.totalBytes !== b.totalBytes) {
-    return a.totalBytes - b.totalBytes;
+  if (
+    a.totalBytes !==
+    b.totalBytes
+  ) {
+    return (
+      a.totalBytes -
+      b.totalBytes
+    );
   }
 
   /*
    * Lower latency wins.
    */
-  if (a.latencyMs !== b.latencyMs) {
-    return a.latencyMs - b.latencyMs;
+  if (
+    a.latencyMs !==
+    b.latencyMs
+  ) {
+    return (
+      a.latencyMs -
+      b.latencyMs
+    );
   }
 
   /*
    * Finally candidateOrder.
    */
   return (
-    candidateOrderIndex.get(a.name) -
-    candidateOrderIndex.get(b.name)
+    candidateOrderIndex.get(
+      a.name
+    ) -
+    candidateOrderIndex.get(
+      b.name
+    )
   );
 }
 
@@ -1178,10 +1429,18 @@ function compareCandidatePreference(
 function handleFreeze(body) {
   console.log(
     '[FREEZE] Received freeze request:',
-    JSON.stringify(body, null, 2)
+    JSON.stringify(
+      body,
+      null,
+      2
+    )
   );
 
-  if (!validateFreezeStructure(body)) {
+  if (
+    !validateFreezeStructure(
+      body
+    )
+  ) {
     console.log(
       '[FREEZE] Returning HTTP 400 INVALID_INPUT'
     );
@@ -1195,11 +1454,19 @@ function handleFreeze(body) {
   }
 
   const fingerprint =
-    canonicalFreezeInput(body);
+    canonicalFreezeInput(
+      body
+    );
 
-  if (freezes.has(body.freezeId)) {
+  if (
+    freezes.has(
+      body.freezeId
+    )
+  ) {
     const existing =
-      freezes.get(body.freezeId);
+      freezes.get(
+        body.freezeId
+      );
 
     if (
       existing.inputFingerprint ===
@@ -1224,22 +1491,38 @@ function handleFreeze(body) {
     return {
       status: 409,
       body: {
-        error: 'FREEZE_ID_CONFLICT'
+        error:
+          'FREEZE_ID_CONFLICT'
       }
     };
   }
 
   const response =
-    buildFreezeResponse(body);
+    buildFreezeResponse(
+      body
+    );
 
-  freezes.set(body.freezeId, {
-    inputFingerprint: fingerprint,
-    response
-  });
+  freezes.set(
+    body.freezeId,
+    {
+      inputFingerprint:
+        fingerprint,
+      response
+    }
+  );
 
   console.log(
     '[FREEZE] Successfully frozen:',
     body.freezeId
+  );
+
+  console.log(
+    '[FREEZE] Response:',
+    JSON.stringify(
+      response,
+      null,
+      2
+    )
   );
 
   return {
@@ -1257,10 +1540,18 @@ function handleFreeze(body) {
 function handleSelect(body) {
   console.log(
     '[SELECT] Received select request:',
-    JSON.stringify(body, null, 2)
+    JSON.stringify(
+      body,
+      null,
+      2
+    )
   );
 
-  if (!validateSelectStructure(body)) {
+  if (
+    !validateSelectStructure(
+      body
+    )
+  ) {
     console.log(
       '[SELECT] Returning HTTP 400 INVALID_INPUT'
     );
@@ -1274,7 +1565,9 @@ function handleSelect(body) {
   }
 
   const frozen =
-    freezes.get(body.freezeId);
+    freezes.get(
+      body.freezeId
+    );
 
   if (!frozen) {
     console.log(
@@ -1285,17 +1578,19 @@ function handleSelect(body) {
     return {
       status: 200,
       body: {
-        freezeId: body.freezeId,
+        freezeId:
+          body.freezeId,
         selected: null,
         results: [],
-        packageManifest: null
+        packageManifest:
+          null
       }
     };
   }
 
   /*
    * Candidate array must exactly equal
-   * stored frozen response.
+   * the stored frozen response.
    */
   if (
     !candidateArrayExactlyEquals(
@@ -1307,13 +1602,18 @@ function handleSelect(body) {
       '[SELECT] Candidate array does not exactly match frozen candidates'
     );
 
-    const names = body.candidates
-      .filter(
-        c =>
-          isPlainObject(c) &&
-          isNonEmptyString(c.name)
-      )
-      .map(c => c.name);
+    const names =
+      body.candidates
+        .filter(
+          c =>
+            isPlainObject(c) &&
+            isNonEmptyString(
+              c.name
+            )
+        )
+        .map(
+          c => c.name
+        );
 
     const candidateNames =
       new Set(names);
@@ -1321,7 +1621,8 @@ function handleSelect(body) {
     const orderValid =
       validateCandidateOrder(
         candidateNames,
-        body.policy.candidateOrder
+        body.policy
+          .candidateOrder
       );
 
     if (!orderValid) {
@@ -1332,10 +1633,12 @@ function handleSelect(body) {
       return {
         status: 200,
         body: {
-          freezeId: body.freezeId,
+          freezeId:
+            body.freezeId,
           selected: null,
           results: [],
-          packageManifest: null
+          packageManifest:
+            null
         }
       };
     }
@@ -1351,7 +1654,8 @@ function handleSelect(body) {
   if (
     !validateCandidateOrder(
       storedNames,
-      body.policy.candidateOrder
+      body.policy
+        .candidateOrder
     )
   ) {
     console.log(
@@ -1361,23 +1665,31 @@ function handleSelect(body) {
     return {
       status: 200,
       body: {
-        freezeId: body.freezeId,
+        freezeId:
+          body.freezeId,
         selected: null,
         results: [],
-        packageManifest: null
+        packageManifest:
+          null
       }
     };
   }
 
   /*
-   * Latency keys must correspond to
-   * candidate names.
+   * Latency keys must correspond
+   * to candidate names.
    */
   const latencyNames =
-    Object.keys(body.latencies);
+    Object.keys(
+      body.latencies
+    );
 
-  for (const name of latencyNames) {
-    if (!storedNames.has(name)) {
+  for (
+    const name of latencyNames
+  ) {
+    if (
+      !storedNames.has(name)
+    ) {
       console.log(
         '[SELECT] Unknown latency candidate:',
         name
@@ -1386,78 +1698,104 @@ function handleSelect(body) {
       return {
         status: 200,
         body: {
-          freezeId: body.freezeId,
+          freezeId:
+            body.freezeId,
           selected: null,
           results: [],
-          packageManifest: null
+          packageManifest:
+            null
         }
       };
     }
   }
 
-  const orderIndex = new Map();
+  const orderIndex =
+    new Map();
 
-  body.policy.candidateOrder.forEach(
-    (name, index) => {
-      orderIndex.set(name, index);
+  body.policy
+    .candidateOrder
+    .forEach(
+      (name, index) => {
+        orderIndex.set(
+          name,
+          index
+        );
+      }
+    );
+
+  const results =
+    body.candidates.map(
+      candidate => {
+        const latency =
+          body.latencies[
+            candidate.name
+          ];
+
+        return buildSelectionResult(
+          candidate,
+          body.rows,
+          body.policy,
+          latency
+        );
+      }
+    );
+
+  results.sort(
+    (a, b) => {
+      const ai =
+        orderIndex.has(a.name)
+          ? orderIndex.get(
+              a.name
+            )
+          : Number.MAX_SAFE_INTEGER;
+
+      const bi =
+        orderIndex.has(b.name)
+          ? orderIndex.get(
+              b.name
+            )
+          : Number.MAX_SAFE_INTEGER;
+
+      if (ai !== bi) {
+        return ai - bi;
+      }
+
+      return compareUtf8(
+        a.name,
+        b.name
+      );
     }
   );
 
-  const results =
-    body.candidates.map(candidate => {
-      const latency =
-        body.latencies[candidate.name];
-
-      return buildSelectionResult(
-        candidate,
-        body.rows,
-        body.policy,
-        latency
-      );
-    });
-
-  results.sort((a, b) => {
-    const ai = orderIndex.has(a.name)
-      ? orderIndex.get(a.name)
-      : Number.MAX_SAFE_INTEGER;
-
-    const bi = orderIndex.has(b.name)
-      ? orderIndex.get(b.name)
-      : Number.MAX_SAFE_INTEGER;
-
-    if (ai !== bi) {
-      return ai - bi;
-    }
-
-    return compareUtf8(
-      a.name,
-      b.name
-    );
-  });
-
   const admitted =
     results.filter(
-      result => result.admitted
+      result =>
+        result.admitted
     );
 
   let selected = null;
   let packageManifest = null;
 
-  if (admitted.length > 0) {
-    admitted.sort((a, b) =>
-      compareCandidatePreference(
-        a,
-        b,
-        orderIndex
-      )
+  if (
+    admitted.length > 0
+  ) {
+    admitted.sort(
+      (a, b) =>
+        compareCandidatePreference(
+          a,
+          b,
+          orderIndex
+        )
     );
 
-    selected = admitted[0].name;
+    selected =
+      admitted[0].name;
 
     const winner =
       frozen.response.candidates.find(
         candidate =>
-          candidate.name === selected
+          candidate.name ===
+          selected
       );
 
     packageManifest =
@@ -1465,12 +1803,14 @@ function handleSelect(body) {
   }
 
   console.log(
-    '[SELECT] Result:',
+    '[SELECT] Selected:',
+    selected
+  );
+
+  console.log(
+    '[SELECT] Results:',
     JSON.stringify(
-      {
-        freezeId: body.freezeId,
-        selected
-      },
+      results,
       null,
       2
     )
@@ -1479,7 +1819,8 @@ function handleSelect(body) {
   return {
     status: 200,
     body: {
-      freezeId: body.freezeId,
+      freezeId:
+        body.freezeId,
       selected,
       results,
       packageManifest
@@ -1496,7 +1837,11 @@ function handleSelect(body) {
 function handleQuantize(body) {
   console.log(
     '[QUANTIZE] Incoming body:',
-    JSON.stringify(body, null, 2)
+    JSON.stringify(
+      body,
+      null,
+      2
+    )
   );
 
   if (!isPlainObject(body)) {
@@ -1517,20 +1862,30 @@ function handleQuantize(body) {
     body.phase
   );
 
-  if (body.phase === 'freeze') {
+  if (
+    body.phase ===
+    'freeze'
+  ) {
     console.log(
       '[QUANTIZE] Processing freeze request'
     );
 
-    return handleFreeze(body);
+    return handleFreeze(
+      body
+    );
   }
 
-  if (body.phase === 'select') {
+  if (
+    body.phase ===
+    'select'
+  ) {
     console.log(
       '[QUANTIZE] Processing select request'
     );
 
-    return handleSelect(body);
+    return handleSelect(
+      body
+    );
   }
 
   console.log(
@@ -1558,39 +1913,50 @@ function readBody(req) {
 
       req.setEncoding('utf8');
 
-      req.on('data', chunk => {
-        data += chunk;
+      req.on(
+        'data',
+        chunk => {
+          data += chunk;
 
-        /*
-         * Prevent pathological requests from
-         * consuming unlimited memory.
-         */
-        if (
-          Buffer.byteLength(
-            data,
-            'utf8'
-          ) >
-          20 * 1024 * 1024
-        ) {
-          console.log(
-            '[HTTP] Request body too large'
-          );
+          /*
+           * Prevent pathological requests
+           * from consuming unlimited memory.
+           */
+          if (
+            Buffer.byteLength(
+              data,
+              'utf8'
+            ) >
+            20 *
+              1024 *
+              1024
+          ) {
+            console.log(
+              '[HTTP] Request body too large'
+            );
 
-          reject(
-            new Error(
-              'BODY_TOO_LARGE'
-            )
-          );
+            reject(
+              new Error(
+                'BODY_TOO_LARGE'
+              )
+            );
 
-          req.destroy();
+            req.destroy();
+          }
         }
-      });
+      );
 
-      req.on('end', () => {
-        resolve(data);
-      });
+      req.on(
+        'end',
+        () => {
+          resolve(data);
+        }
+      );
 
-      req.on('error', reject);
+      req.on(
+        'error',
+        reject
+      );
     }
   );
 }
@@ -1601,137 +1967,152 @@ function readBody(req) {
  * --------------------------------------------------------------------------
  */
 
-const server = http.createServer(
-  async (req, res) => {
-    console.log(
-      `[HTTP] ${req.method} ${req.url}`
-    );
-
-    /*
-     * Health check
-     */
-    if (
-      req.method === 'GET' &&
-      req.url === '/health'
-    ) {
-      return sendJson(
-        res,
-        200,
-        {
-          status: 'ok'
-        }
-      );
-    }
-
-    /*
-     * Only POST /quantize is supported.
-     */
-    if (
-      req.method !== 'POST' ||
-      req.url !== '/quantize'
-    ) {
+const server =
+  http.createServer(
+    async (req, res) => {
       console.log(
-        '[HTTP] 404 NOT_FOUND'
+        `[HTTP] ${req.method} ${req.url}`
       );
 
-      return sendJson(
-        res,
-        404,
-        {
-          error: 'NOT_FOUND'
-        }
-      );
-    }
+      /*
+       * Health check
+       */
+      if (
+        req.method ===
+          'GET' &&
+        req.url ===
+          '/health'
+      ) {
+        return sendJson(
+          res,
+          200,
+          {
+            status: 'ok'
+          }
+        );
+      }
 
-    /*
-     * Require JSON.
-     */
-    const contentType =
-      req.headers['content-type'] || '';
-
-    console.log(
-      '[HTTP] Content-Type:',
-      contentType
-    );
-
-    if (
-      !contentType
-        .toLowerCase()
-        .startsWith(
-          'application/json'
-        )
-    ) {
-      console.log(
-        '[HTTP] INVALID_INPUT: Content-Type must be application/json'
-      );
-
-      return sendJson(
-        res,
-        400,
-        {
-          error: 'INVALID_INPUT'
-        }
-      );
-    }
-
-    try {
-      const raw =
-        await readBody(req);
-
-      console.log(
-        '[HTTP] Raw body length:',
-        Buffer.byteLength(
-          raw,
-          'utf8'
-        )
-      );
-
-      let body;
-
-      try {
-        body = JSON.parse(raw);
-      } catch (error) {
+      /*
+       * Only POST /quantize
+       * is supported.
+       */
+      if (
+        req.method !==
+          'POST' ||
+        req.url !==
+          '/quantize'
+      ) {
         console.log(
-          '[HTTP] INVALID_INPUT: invalid JSON'
+          '[HTTP] 404 NOT_FOUND'
+        );
+
+        return sendJson(
+          res,
+          404,
+          {
+            error:
+              'NOT_FOUND'
+          }
+        );
+      }
+
+      /*
+       * Require JSON.
+       */
+      const contentType =
+        req.headers[
+          'content-type'
+        ] || '';
+
+      console.log(
+        '[HTTP] Content-Type:',
+        contentType
+      );
+
+      if (
+        !contentType
+          .toLowerCase()
+          .startsWith(
+            'application/json'
+          )
+      ) {
+        console.log(
+          '[HTTP] INVALID_INPUT: Content-Type must be application/json'
         );
 
         return sendJson(
           res,
           400,
           {
-            error: 'INVALID_INPUT'
+            error:
+              'INVALID_INPUT'
           }
         );
       }
 
-      const result =
-        handleQuantize(body);
+      try {
+        const raw =
+          await readBody(req);
 
-      console.log(
-        `[HTTP] Response status: ${result.status}`
-      );
+        console.log(
+          '[HTTP] Raw body length:',
+          Buffer.byteLength(
+            raw,
+            'utf8'
+          )
+        );
 
-      return sendJson(
-        res,
-        result.status,
-        result.body
-      );
-    } catch (error) {
-      console.error(
-        '[HTTP] Request processing error:',
-        error
-      );
+        let body;
 
-      return sendJson(
-        res,
-        400,
-        {
-          error: 'INVALID_INPUT'
+        try {
+          body =
+            JSON.parse(raw);
+        } catch (error) {
+          console.log(
+            '[HTTP] INVALID_INPUT: invalid JSON'
+          );
+
+          return sendJson(
+            res,
+            400,
+            {
+              error:
+                'INVALID_INPUT'
+            }
+          );
         }
-      );
+
+        const result =
+          handleQuantize(
+            body
+          );
+
+        console.log(
+          `[HTTP] Response status: ${result.status}`
+        );
+
+        return sendJson(
+          res,
+          result.status,
+          result.body
+        );
+      } catch (error) {
+        console.error(
+          '[HTTP] Request processing error:',
+          error
+        );
+
+        return sendJson(
+          res,
+          400,
+          {
+            error:
+              'INVALID_INPUT'
+          }
+        );
+      }
     }
-  }
-);
+  );
 
 /*
  * --------------------------------------------------------------------------
