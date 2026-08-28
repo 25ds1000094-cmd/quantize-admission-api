@@ -171,12 +171,8 @@ app.post('/quantize', (req, res) => {
 
     const storedRecord = freezeStore.get(freezeId);
     
-    // Verify supplied candidates match stored freeze response candidates exactly
-    if (!candidates || JSON.stringify(candidates) !== JSON.stringify(storedRecord.response.candidates)) {
-      return res.status(400).json({ error: 'INVALID_INPUT' });
-    }
-
-    if (!policy || typeof policy !== 'object' || !Array.isArray(rows) || !latencies || typeof latencies !== 'object') {
+    // Validate structural requirements for select request
+    if (!Array.isArray(candidates) || !policy || typeof policy !== 'object' || !Array.isArray(rows) || !latencies || typeof latencies !== 'object') {
       return res.status(400).json({ error: 'INVALID_INPUT' });
     }
 
@@ -196,19 +192,25 @@ app.post('/quantize', (req, res) => {
 
     const results = [];
     let winner = null;
-    let bestScoreKey = null; // for tie-breaking: bytes, latency, candidateOrder index
+    let bestScoreKey = null;
+
+    // Map stored candidates for quick lookup by name (flexible matching)
+    const storedCandidatesMap = new Map(storedRecord.response.candidates.map(c => [c.name, c]));
 
     for (const c of candidates) {
-      const name = c.name;
+      if (!c || (typeof c !== 'object' && typeof c !== 'string')) continue;
+      const name = typeof c === 'string' ? c : c.name;
+      const storedCandidate = storedCandidatesMap.get(name);
+
       let aggregate = null;
       let slices = {};
-      let totalBytes = c.totalBytes;
+      let totalBytes = storedCandidate ? storedCandidate.totalBytes : (c.totalBytes !== undefined ? c.totalBytes : null);
       let latencyMs = latencies[name] !== undefined ? latencies[name] : null;
       let admitted = true;
       let reasonCodes = [];
 
       // Validate lineage & manifest from stored record/candidate state
-      if (c.status !== 'frozen') {
+      if (!storedCandidate || storedCandidate.status !== 'frozen') {
         admitted = false;
         reasonCodes.push('NOT_FROZEN');
       }
@@ -247,7 +249,6 @@ app.post('/quantize', (req, res) => {
       if (totalRows > 0 && admitted) {
         aggregate = Number((correctRows / totalRows).toFixed(12));
         
-        // Compute slice accuracies
         for (const [sName, stats] of Object.entries(sliceStats)) {
           slices[sName] = Number((stats.correct / stats.total).toFixed(12));
         }
@@ -297,12 +298,10 @@ app.post('/quantize', (req, res) => {
         reasonCodes: sortCodes(reasonCodes)
       });
 
-      // Track winner selection rules if admitted
       if (admitted) {
         const orderIdx = candidateOrder.indexOf(name);
         const validOrderIdx = orderIdx !== -1 ? orderIdx : Infinity;
         
-        // Tie-breaking: smaller bytes, lower latency, then candidate order
         const scoreKey = {
           bytes: totalBytes,
           latency: latencyMs,
@@ -321,7 +320,6 @@ app.post('/quantize', (req, res) => {
       }
     }
 
-    // Order results by candidateOrder, using UTF-8 name as fallback
     results.sort((a, b) => {
       const idxA = candidateOrder.indexOf(a.name);
       const idxB = candidateOrder.indexOf(b.name);
